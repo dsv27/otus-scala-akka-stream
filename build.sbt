@@ -2,7 +2,10 @@ name := "akka_streams_demo"
 
 version := "0.1"
 
+
 scalaVersion := "2.13.4"
+
+addCompilerPlugin("io.tryp" % "splain" % "0.5.8" cross CrossVersion.patch)
 
 val AkkaVersion = "2.6.10"
 libraryDependencies += "com.typesafe.akka" %% "akka-stream" % AkkaVersion
@@ -21,4 +24,8 @@ libraryDependencies ++= Seq(
   "io.circe" %% "circe-core",
   "io.circe" %% "circe-generic",
   "io.circe" %% "circe-parser"
+  //,"io.circe" %% "circe-generic-extras"
   ).map(_ % circeVersion)
+  
+  libraryDependencies += "com.github.scopt" %% "scopt" % "4.0.0"
+  
