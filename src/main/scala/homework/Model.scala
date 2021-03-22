@@ -23,7 +23,9 @@ object Model {
     def apply(ledgerResponse: LedgerResponse): LedgerWrapper =
       new LedgerWrapper(ledgerResponse.id, ledgerResponse)
   }
-
+implicit val LedgerWrapperEncoder: Encoder[LedgerWrapper] =
+    deriveEncoder[LedgerWrapper]
+    
   case class TransactionWrapper(
       id: String,
       transactionHistory: TransactionHistory
