@@ -4,6 +4,7 @@ import io.circe.{Decoder, Encoder}
 import stellar.sdk._
 import io.circe.syntax._
 import io.circe.parser._
+import com.typesafe.scalalogging._
 
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -11,7 +12,16 @@ import scala.concurrent.duration._
 import stellar.sdk.model.{HorizonOrder, HorizonCursor, Record}
 
 import akka.stream.alpakka.mongodb.scaladsl.{MongoFlow, MongoSource, MongoSink}
+
 import com.mongodb.reactivestreams.client.{MongoCollection, MongoClients}
+import com.mongodb.client.model.{Projections, Sorts, Field, BsonField}
+
+import org.bson.codecs.configuration.CodecRegistries.{
+  fromProviders,
+  fromRegistries
+}
+import org.mongodb.scala.bson.codecs._
+import org.mongodb.scala.bson.codecs.Macros._
 import org.bson.Document
 
 import akka._
@@ -23,13 +33,17 @@ import akka.stream.Attributes
 import scala.concurrent._
 import scala.util.matching.Regex
 import scopt.OParser
+import stellar.sdk.model.response.NetworkInfo
+import shapeless.ops.zipper
+import scala.util.Try
+import scala.collection.immutable.NumericRange
 
 case class Config(
     start: Long = -1L,
     end: Long = -1L
 )
 
-object Main extends App {
+object Main extends App with LazyLogging {
 
   /** ETL процесс загрузки с TestNetwork
     * --start - начальное значение Ledger для загрузки
@@ -43,6 +57,7 @@ object Main extends App {
 
   def asDocument[T: Encoder](t: T): Document = {
     Document.parse(t.asJson.noSpaces)
+    //Document(t.asJson.noSpaces)
   }
 
   def fromDocument[T: Decoder](doc: Document): Either[Throwable, T] = {
@@ -55,26 +70,32 @@ object Main extends App {
     * @param ledger значение Ledger которе вернется если в БД нет записанной инофрмации
     * @return
     */
-  def LedgerIdGetFromBD(
+  def LedgerIdGetFromDB(
       ledgerColl: MongoCollection[Document],
-      ledger: Long = 0L
+      ledgerMax: Future[NetworkInfo],
+      ledger: Long
   ) = {
-    val ledgerToRegex: Regex = """\{"sequence": (\d+)\}""".r
-    val getMaxLenger = MongoSource(
+
+    val ledgerMaxSource =
+      Source.fromFuture(ledgerMax).map(v => v.latestLedger)
+    val mngSource = MongoSource(
       ledgerColl
-        .find(new Document)
-        .sort(Document.parse("{sequence: 1}"))
-        .limit(1)
-        .projection(Document.parse("{_id: 0, ledgerResponse: {sequence: 1} }"))
-    )
-    val rows =
-      Await.result(getMaxLenger.runWith(Sink.seq), 30.second)
-    if (rows.isEmpty)
-      ledger
-    else if (ledgerToRegex.findAllIn(rows.head.toJson()).group(1).isEmpty)
-      ledger
-    else
-      ledgerToRegex.findAllIn(rows.head.toJson()).group(1).toLong
+        .find()
+        .sort(Sorts.descending("ledgerResponse.sequence"))
+        .projection(
+          Projections.fields(
+            Projections.include("ledgerResponse.sequence"),
+            Projections.excludeId()
+          )
+        )
+        .first
+    ).map { a =>
+      a.get("ledgerResponse").asInstanceOf[Document] match {
+        case v1 if (v1.isEmpty) => ledger
+        case v2                 => v2.get("sequence").asInstanceOf[Int].toLong
+      }
+    }
+    mngSource.zip(ledgerMaxSource)
   }
 
   /** Получение пакета данных согласно  Ledger, работает в пакетном режиме
@@ -83,7 +104,7 @@ object Main extends App {
     * @return Пакет данных
     */
   def LedgerStatusGetBatch(ledgerId: Long) = {
-    val v2 = for {
+    for {
       l ← network.ledger(ledgerId).map(LedgerWrapper(_))
       t ← network
         .transactionsByLedger(ledgerId)
@@ -98,9 +119,21 @@ object Main extends App {
         .map { _.toList }
         .map(ef => ef.map(EffectWrapper(_)))
     } yield (l, t, o, e)
-    Await.result(v2, 20.second)
   }
 
+  /** Завершение процесса по окончанию данных
+    *
+    * @param h Состояние стрима
+    * @return 
+    */
+  def endStream(h: Try[Done]): Unit = {
+    if (h.isSuccess) {
+      logger.debug("Normal stream shutdown operation.")
+    } else {
+      logger.error("Emergency stream shutdown operation.")
+    }
+  }
+  
   val cmdBuilder = OParser.builder[Config]
   val cmdParser = {
     import cmdBuilder._
@@ -127,21 +160,22 @@ object Main extends App {
 
   // Определяем диапазон загрузки, из командной строки или из базы данных и состояния на сервере
 
-  val ledgerLoad: (Long, Long) =
+  val ledgerLoad =
     OParser.parse(cmdParser, args, Config()) match {
       case Some(config) =>
-        (config.start, config.end)
+        Source(Seq(config.start)).zip(Source(Seq(config.end)))
       case _ =>
-        val ledgerIdMax = Await.result(network.info(), 30.seconds).latestLedger
-        (LedgerIdGetFromBD(ledgerColl, ledgerIdMax - 10), ledgerIdMax)
+        //val ledgerIdMax = Await.result(network.info(), 30.seconds).latestLedger
+        LedgerIdGetFromDB(ledgerColl, network.info(), 10L)
     }
 
   // Настройка графа выполнения
   val runnableGraphBatch = RunnableGraph.fromGraph(GraphDSL.create() {
     implicit builder: GraphDSL.Builder[NotUsed] ⇒
       import GraphDSL.Implicits._
-      val in = Source(ledgerLoad._1 to ledgerLoad._2)
-        .map(ledgerId => LedgerStatusGetBatch(ledgerId))
+
+      val getLadger  = ledgerLoad.flatMapConcat(x => Source(x._1 to x._2))
+        .mapAsync(1) { ledgerId => LedgerStatusGetBatch(ledgerId) }
         .log(name = "Read ledger data")
         .addAttributes(
           Attributes.logLevels(
@@ -191,8 +225,12 @@ object Main extends App {
             onFailure = Attributes.LogLevels.Error
           )
         )
-      val blackHole = Sink.foreach { x: Any ⇒ (x) }
-      val printData = Sink.foreach { x: Any ⇒ println(s"Inserting :$x") }
+        def toSeq[T](x:T) : Seq[T] = Seq[T](x)
+
+      val seqFlow = Flow.fromFunction(toSeq[Document])
+      val mergeFlow = builder.add(Merge[Seq[Document]](4))
+      val endSink = Sink.onComplete(endStream)
+
       val bcast = builder.add(
         Broadcast[
           (
@@ -203,31 +241,29 @@ object Main extends App {
           )
         ](4)
       )
-      in ~> bcast.in
-      bcast
-        .out(0)
-        .map(data => asDocument(data._1)) ~> insertLenger ~> blackHole
+      getLadger ~> bcast.in
+      bcast.out(0).map(data => asDocument(data._1)) ~> insertLenger ~> seqFlow ~> mergeFlow
+        .in(0)
       bcast
         .out(1)
         .map(data =>
           data._2.map(tr => asDocument(tr))
-        ) ~> insertTransaction ~> blackHole
+        ) ~> insertTransaction ~> mergeFlow.in(1)
       bcast
         .out(2)
         .map(data =>
           data._3.map(op => asDocument(op))
-        ) ~> insertOperation ~> blackHole
+        ) ~> insertOperation ~> mergeFlow.in(2)
       bcast
         .out(3)
         .map(data =>
           data._4.map(ef => asDocument(ef))
-        ) ~> insertEffects ~> blackHole
+        ) ~> insertEffects ~> mergeFlow.in(3)
+      mergeFlow.out ~> endSink
       ClosedShape
   })
 
   runnableGraphBatch.run()
-
-  system.terminate()
   client.close()
 
 }
